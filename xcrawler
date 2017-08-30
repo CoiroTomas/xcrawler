@@ -1,0 +1,241 @@
+#!/usr/bin/python3
+import sys
+import sqlite3
+import urllib.request
+import queue
+import threading
+import http.cookiejar
+from html.parser import HTMLParser
+from urllib import parse
+
+injection = ["%3Cscript%3Ealert(String.fromCharCode(88%2C83%2C83))%3C%2Fscript%3E",
+    "javascript%3Aalert(%27XSS%27)"]
+
+visited = set()
+domain = ""
+
+class GetRequest(object):
+    link = ""
+    variable = ""
+    def __init__(self, link):
+        self.link = link
+
+    def request(self, opener):
+        print("GET", self.link)
+        resp = opener.open(self.link)
+        return resp.read().decode()
+
+    def method(self):
+        return 'GET'
+
+class PostRequest(object):
+    link = ""
+    variable = ""
+    post_parameters = {}
+    def __init__(self, link):
+        self.link = link
+
+    def add_parameter(self, name, value):
+        self.post_parameters[name] = value
+
+    def request(self, opener):
+        print("POST", self.link, self.post_parameters)
+        data = parse.urlencode(self.post_parameters).encode()
+        req = urllib.request.Request(self.link, data=data)
+        return opener.open(req).read().decode()
+
+    def method(self):
+        return "POST"
+
+class LinkParser(HTMLParser):
+    links = set()
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if (tag == "a"):
+            if ("href" in attrs):
+                href = attrs["href"]
+                self.links.add(href)
+                
+class XssParser(HTMLParser):
+    script = False
+    vulnerable = False
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if (tag.lower() == "script"):
+            self.script = True
+    
+        if ("src" in attrs):
+            if ("javascript:alert(String.fromCharCode(88,83,83))" in attrs["src"]):
+                self.vulnerable = True
+    
+    def handle_endtag(self, tag):
+        if (tag.lower() == "script"):
+            self.script = False
+    
+    def handle_data(self, data):
+        if (self.script):
+            if ("alert(String.fromCharCode(88,83,83))" in data):
+                self.vulnerable = True
+
+class Form(object):
+    method = "GET"
+    def __init__(self, path):
+        self.path = path
+        self.inputs = {}
+
+    def possible_vulns(self, path):
+        paths = []
+        if self.path == "":
+            self.path = path
+        if "GET" in self.method.upper():
+            for inpt in self.inputs:
+                link = "http://" + domain + self.path + "?"
+                if self.inputs[inpt] in ["text", "search"]:
+                    for inj in injection:
+                        link = link + inpt + "=" + inj + "&"
+                        req = GetRequest(link[0:-1])
+                        req.variable = inpt
+                        paths.append(req)
+                for inpt2 in self.inputs:
+                    if inpt != inpt2:
+                        link = link + inpt2 + "=1&"
+                req = GetRequest(link[0:-1])
+                req.variable = inpt
+                paths.append(req)
+        if "POST" in self.method.upper():
+            for inpt in self.inputs:
+                if self.inputs[inpt] in ["text", "search"]:
+                    for inj in injection:
+                        link = "http://" + domain + self.path
+                        req = PostRequest(link)
+                        req.add_parameter(inpt, inj)
+                        for inpt2 in self.inputs:
+                            if inpt != inpt2:
+                                req.add_parameter(inpt2, "1")
+                        req.variable = inpt
+                        paths.append(req)
+        return paths
+    
+class FormParser(HTMLParser):
+    forms = []
+    current = Form("a")
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            if "action" in attrs:
+                action = attrs["action"]
+                if action.startswith("\\'"):
+                    action = action[2:-2]
+                self.current = Form(action)
+            if "method" in attrs:
+                self.current.method = attrs["method"]
+            else:
+                self.current.method = "GET"
+        elif tag == "input":
+            if "name" in attrs and "type" in attrs:
+                name = attrs["name"]
+                typ = attrs["type"]
+                self.current.inputs[name] = typ
+            elif "name" in attrs:
+                name = attrs["name"]
+                self.current.inputs[name] = "text"
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.forms.append(self.current)  
+
+def handle_page(page_queue):
+    conn = sqlite3.connect("vulnerabilities.db")
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS vulnerable
+        (url text, variable text, method text)""")
+    conn.commit()
+
+    while True:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        for cookie in cookies:
+            opener.addheaders.append(("Cookie", cookie))
+
+        req = page_queue.get()
+        if already_visited(req.link):
+            continue
+        visited.add(req.link)
+        try:
+            page = req.request(opener)
+            
+            if is_vulnerable(page):
+                print("Found XSS in", req.link)
+                cur.execute("INSERT INTO vulnerable(url, variable, method) VALUES(?, ?, ?)",
+                      (req.link, req.variable, req.method()))
+                conn.commit()
+        
+            for form in get_forms_in_page(page, req.link):
+                q.put(form)
+            for href in get_links_in_page(page, domain):
+                q.put(href)
+        except Exception as e:
+            print("There was an error in the request", req.link)
+            print(e)
+
+def get_links_in_page(page, domain):
+    links = set()
+    parser = LinkParser()
+    parser.feed(page)
+    for link in parser.links:
+        if len(link) < 2:
+            continue
+        if link.startswith("http"):
+            parsed = parse.urlparse(link)
+            if domain in parsed.netloc:
+                links.add(GetRequest(link))
+        else:
+            fulllink = domain + link
+            if not fulllink.startswith("http"):
+                fulllink = "http://" + fulllink
+            links.add(GetRequest(fulllink))
+
+    return links
+
+def get_forms_in_page(page, domain):
+    links = set()
+    parser = FormParser()
+    parser.feed(page)
+    for forms in parser.forms:
+        parsed = parse.urlparse(domain)
+        for form in forms.possible_vulns(parsed.path):
+            links.add(form)
+
+    return links
+    
+def is_vulnerable(page):
+    parser = XssParser()
+    parser.feed(page)
+    return parser.vulnerable
+
+def already_visited(link):
+    return link in visited
+
+if __name__ == "__main__":
+    if (len(sys.argv) < 3):
+        print("Missing arguments")
+        print("Usage:", sys.argv[0], "LINK THREADS [COOKIE1=VALUE1 ...]")
+        exit(0)
+    userlink = sys.argv[1]
+    threads = int(sys.argv[2])
+    cookies = []
+    
+    if (len(sys.argv) >= 3):
+        for i in range(3, len(sys.argv)):
+            cookies.append(sys.argv[i])
+
+    q = queue.Queue()
+    q.put(GetRequest(userlink))
+    for inj in injection:
+        q.put(GetRequest(userlink + inj))
+    parsed_uri = parse.urlparse(userlink)
+    domain = str(parsed_uri.netloc)
+    for i in range(0, threads):
+        threading.Thread(target=handle_page, args=(q,)).start()
+
+            
